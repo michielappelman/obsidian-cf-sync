@@ -29,7 +29,7 @@ Clone this repository and install dependencies with `pnpm install --frozen-lockf
 
 1. Enable R2 in Cloudflare and set `bucket_name` in `packages/worker/wrangler.toml` to your bucket name. To create a bucket, run `pnpm --filter @cf-sync/worker exec wrangler r2 bucket create <bucket-name>`.
 2. Assign your HTTPS hostname to the Worker as a custom domain. Use this origin, without a path, as the server URL in the plugin.
-3. Protect the sync API at `/api/*` with an Access self-hosted application, allow only your email address, and enable Managed OAuth.
+3. Protect the sync API at both `/api` and `/api/*` with an Access self-hosted application, allow only your email address, and enable Managed OAuth. The plugin starts sign-in at `/api`, which `/api/*` alone does not cover.
 4. Set the allowed OAuth redirect URI to `https://<hostname>/oauth/callback`.
 5. Set the desired access token lifetime to 15 minutes and the Grant session duration to 30 days.
 6. Configure the Worker environment variables below. For local development, put the same values in `packages/worker/.dev.vars`.
@@ -45,6 +45,10 @@ pnpm --filter @cf-sync/worker exec wrangler secret put ACCESS_TEAM_DOMAIN
 pnpm --filter @cf-sync/worker exec wrangler secret put ACCESS_AUD
 pnpm deploy
 ```
+
+### Search
+
+`GET /api/vaults/:id/search?q=<query>&limit=<1-50>` searches a vault with [AI Search](https://developers.cloudflare.com/ai-search/). It returns `{query, results: [{path, score, text}]}`. The Worker binds an AI Search instance named `obsidian-cf-sync`, so create it before deploying: R2-backed on your bucket, include only `vaults/*/files/**`, similarity cache off. The index refreshes on the instance's sync interval, so recent edits and deletions appear after the next sync. AI Search stores note text in its own index.
 
 ## Plugin installation
 

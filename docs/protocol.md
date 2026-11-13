@@ -26,21 +26,22 @@ WebSocketはサーバーからの変更通知に使う。編集は250ms単位で
 
 下表のパスは設定したサーバーオリジンを起点とする。Vault APIには`X-Device-Id`が必須で、未登録・失効済み端末を拒否する。
 
-| メソッドとパス                      | 入力・結果                                               |
-| ----------------------------------- | -------------------------------------------------------- |
-| `POST /api/devices`                 | `{id,name}`で端末を登録。失効したIDは再登録不可          |
-| `GET /api/devices`                  | 端末一覧                                                 |
-| `DELETE /api/devices/:id`           | 端末を失効し、各Vaultの接続も閉じる                      |
-| `GET /api/vaults`                   | Vault一覧                                                |
-| `POST /api/vaults`                  | `{id,name}`でVaultを作成                                 |
-| `GET /api/vaults/:id/snapshot`      | 全ファイルのメタデータ、除外、保存進捗                   |
-| `GET /api/vaults/:id/files/:fileId` | Yjsの全状態または変更不能な添付参照                      |
-| `POST /api/vaults/:id/operations`   | `Operation`を受け取り、DO保存後に`OperationResult`を返す |
-| `PUT /api/vaults/:id/blobs/:uuid`   | 生バイト列を転送し、`BlobRef`を返す                      |
-| `GET /api/vaults/:id/blobs/:uuid`   | 添付の生バイト列                                         |
-| `PUT /api/vaults/:id/exclusions`    | `{exclusions:string[]}`で共有除外を更新                  |
-| `POST /api/vaults/:id/tickets`      | 完全な接続URLと有効期限を返す                            |
-| `GET /ws?vault=uuid&ticket=secret`  | WebSocketへ接続                                          |
+| メソッドとパス                         | 入力・結果                                                            |
+| -------------------------------------- | --------------------------------------------------------------------- |
+| `POST /api/devices`                    | `{id,name}`で端末を登録。失効したIDは再登録不可                       |
+| `GET /api/devices`                     | 端末一覧                                                              |
+| `DELETE /api/devices/:id`              | 端末を失効し、各Vaultの接続も閉じる                                   |
+| `GET /api/vaults`                      | Vault一覧                                                             |
+| `POST /api/vaults`                     | `{id,name}`でVaultを作成                                              |
+| `GET /api/vaults/:id/snapshot`         | 全ファイルのメタデータ、除外、保存進捗                                |
+| `GET /api/vaults/:id/files/:fileId`    | Yjsの全状態または変更不能な添付参照                                   |
+| `POST /api/vaults/:id/operations`      | `Operation`を受け取り、DO保存後に`OperationResult`を返す              |
+| `PUT /api/vaults/:id/blobs/:uuid`      | 生バイト列を転送し、`BlobRef`を返す                                   |
+| `GET /api/vaults/:id/blobs/:uuid`      | 添付の生バイト列                                                      |
+| `PUT /api/vaults/:id/exclusions`       | `{exclusions:string[]}`で共有除外を更新                               |
+| `POST /api/vaults/:id/tickets`         | 完全な接続URLと有効期限を返す                                         |
+| `GET /api/vaults/:id/search?q=&limit=` | AI SearchでVault内を検索。`{query,results:[{path,score,text}]}`を返す |
+| `GET /ws?vault=uuid&ticket=secret`     | WebSocketへ接続                                                       |
 
 添付PUTには`X-Content-Digest`（SHA-256）と`X-Content-Size`（バイト数）を付ける。サーバーは内容と長さを検証し、確定した長さのストリームとしてR2へ書く。同じID・同じ内容の再送は認め、異なる内容でのID再利用を拒否する。20MBをアプリケーションの上限にはしない。
 

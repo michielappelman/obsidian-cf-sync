@@ -5,6 +5,7 @@ export interface Env {
   ACCOUNT: DurableObjectNamespace<Account>;
   VAULTS: DurableObjectNamespace<Vault>;
   BUCKET: R2Bucket;
+  SEARCH: AiSearchInstance;
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_AUD: string;
 }

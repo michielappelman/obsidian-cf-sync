@@ -1,6 +1,9 @@
 name = "obsidian-cf-sync"
 main = "src/index.ts"
 compatibility_date = "2026-09-09"
+routes = [{ pattern = "sync.appelman.family", custom_domain = true }]
+workers_dev = false
+preview_urls = false
 
 [[durable_objects.bindings]]
 name = "ACCOUNT"
@@ -25,3 +28,7 @@ redact_query_string = true
 enabled = true
 head_sampling_rate = 1
 invocation_logs = true
+
+[[ai_search]]
+binding = "SEARCH"
+instance_name = "obsidian-cf-sync"

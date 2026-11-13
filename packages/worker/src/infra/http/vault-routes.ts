@@ -13,6 +13,14 @@ const exclusionsSchema = v.object({
 
 const digestSchema = v.pipe(v.string(), v.regex(/^[a-f0-9]{64}$/));
 
+const searchSchema = v.object({
+  q: v.pipe(v.string(), v.trim(), v.minLength(1), v.maxLength(500)),
+  limit: v.optional(
+    v.pipe(v.string(), v.toNumber(), v.integer(), v.minValue(1), v.maxValue(50)),
+    "10",
+  ),
+});
+
 type VaultContext = {
   Bindings: Env;
   Variables: {
@@ -106,6 +114,31 @@ vaultApiRoutes.get("/blobs/:id", async (c) => {
   const body = unwrapRpcResult(result);
 
   return new Response(body, { headers: { "Content-Type": "application/octet-stream" } });
+});
+
+vaultApiRoutes.get("/search", async (c) => {
+  const { q, limit } = v.parse(searchSchema, c.req.query());
+  const prefix = `vaults/${c.get("vaultId")}/files/`;
+  const result = await c.env.SEARCH.search({
+    query: q,
+    ai_search_options: {
+      retrieval: {
+        max_num_results: limit,
+        // Range on the folder attribute selects this vault's subtree; "0" sorts right after "/".
+        filters: { folder: { $gte: prefix, $lt: `${prefix.slice(0, -1)}0` } },
+      },
+    },
+  });
+  const results = result.chunks
+    .filter((chunk) => chunk.item.key.startsWith(prefix))
+    .map((chunk) => ({
+      path: chunk.item.key.slice(prefix.length),
+      score: chunk.score,
+      text: chunk.text,
+    }));
+
+  c.header("Cache-Control", "no-store");
+  return c.json({ query: result.search_query, results });
 });
 
 vaultApiRoutes.put("/blobs/:id", async (c) => {
