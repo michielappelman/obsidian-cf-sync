@@ -27,12 +27,12 @@ https://github.com/user-attachments/assets/b756b66e-3c62-4bcb-9710-f038a03f7667
 
 このリポジトリを取得し、`pnpm install --frozen-lockfile`で依存パッケージをインストールします。
 
-1. CloudflareでR2を有効にし、`packages/worker/wrangler.toml`の`bucket_name`を自分のバケット名へ変更します。新規作成には`pnpm --filter @cf-sync/worker exec wrangler r2 bucket create <バケット名>`を使います。
-2. 自分のHTTPSホスト名をWorkerのカスタムドメインへ割り当てます。プラグインにはパスを含まないこのオリジンを設定します。
+1. CloudflareでR2を有効にし、`packages/worker/cloudflare.config.ts`の`BUCKET`バインディングの`name`を自分のバケット名へ変更します。新規作成には`pnpm --filter @cf-sync/worker exec cf r2 buckets create --name <バケット名>`を使います。
+2. `packages/worker/cloudflare.config.ts`の`domains`に自分のHTTPSホスト名を設定します。デプロイ時にWorkerのカスタムドメインとして割り当てられます。プラグインにはパスを含まないこのオリジンを設定します。
 3. Accessのself-hosted applicationで同期APIの`/api/*`を保護し、自分のメールアドレスだけを許可します。Managed OAuthを有効にします。
 4. OAuthの許可リダイレクトURIを`https://<ホスト名>/oauth/callback`に設定します。
 5. アクセストークンの寿命は15分、Grant sessionは30日を希望値として設定します。
-6. 以下のWorker環境変数を設定します。ローカル開発では同名の値を`packages/worker/.dev.vars`に記載します。
+6. 以下のWorkerシークレットを`packages/worker/.dev.vars`に記載します。`cf dev`はローカルでこれを読み込み、下記のデプロイコマンドがアップロードします。
 
 | 変数                 | 値                                                       |
 | -------------------- | -------------------------------------------------------- |
@@ -40,10 +40,8 @@ https://github.com/user-attachments/assets/b756b66e-3c62-4bcb-9710-f038a03f7667
 | `ACCESS_AUD`         | AccessアプリのApplication Audience                       |
 
 ```sh
-pnpm --filter @cf-sync/worker exec wrangler login
-pnpm --filter @cf-sync/worker exec wrangler secret put ACCESS_TEAM_DOMAIN
-pnpm --filter @cf-sync/worker exec wrangler secret put ACCESS_AUD
-pnpm deploy
+pnpm --filter @cf-sync/worker exec cf auth login
+pnpm --filter @cf-sync/worker exec cf deploy --secrets-file .dev.vars
 ```
 
 ## プラグインの導入

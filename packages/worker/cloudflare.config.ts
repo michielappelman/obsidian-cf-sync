@@ -21,6 +21,8 @@ export default defineConfig({
 			VaultDO: exports.durableObject({ storage: "sqlite" }),
 		},
 		env: {
+			ACCESS_TEAM_DOMAIN: bindings.secret(),
+			ACCESS_AUD: bindings.secret(),
 			BUCKET: bindings.r2({
 				name: "obsidian-cf-sync",
 			}),

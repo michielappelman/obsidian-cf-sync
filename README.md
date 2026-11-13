@@ -27,12 +27,12 @@ For up to five devices, the targets are about 0.5 seconds for text and 0.2 secon
 
 Clone this repository and install dependencies with `pnpm install --frozen-lockfile`.
 
-1. Enable R2 in Cloudflare and set `bucket_name` in `packages/worker/wrangler.toml` to your bucket name. To create a bucket, run `pnpm --filter @cf-sync/worker exec wrangler r2 bucket create <bucket-name>`.
-2. Assign your HTTPS hostname to the Worker as a custom domain. Use this origin, without a path, as the server URL in the plugin.
+1. Enable R2 in Cloudflare and set the `BUCKET` binding's `name` in `packages/worker/cloudflare.config.ts` to your bucket name. To create a bucket, run `pnpm --filter @cf-sync/worker exec cf r2 buckets create --name <bucket-name>`.
+2. Set `domains` in `packages/worker/cloudflare.config.ts` to your HTTPS hostname; it is assigned to the Worker as a custom domain on deploy. Use this origin, without a path, as the server URL in the plugin.
 3. Protect the sync API at both `/api` and `/api/*` with an Access self-hosted application, allow only your email address, and enable Managed OAuth. The plugin starts sign-in at `/api`, which `/api/*` alone does not cover.
 4. Set the allowed OAuth redirect URI to `https://<hostname>/oauth/callback`.
 5. Set the desired access token lifetime to 15 minutes and the Grant session duration to 30 days.
-6. Configure the Worker environment variables below. For local development, put the same values in `packages/worker/.dev.vars`.
+6. Put the Worker secrets below in `packages/worker/.dev.vars`. `cf dev` reads them locally, and the deploy command below uploads them.
 
 | Variable             | Value                                                                      |
 | -------------------- | -------------------------------------------------------------------------- |
@@ -40,10 +40,8 @@ Clone this repository and install dependencies with `pnpm install --frozen-lockf
 | `ACCESS_AUD`         | The Application Audience of your Access application                        |
 
 ```sh
-pnpm --filter @cf-sync/worker exec wrangler login
-pnpm --filter @cf-sync/worker exec wrangler secret put ACCESS_TEAM_DOMAIN
-pnpm --filter @cf-sync/worker exec wrangler secret put ACCESS_AUD
-pnpm deploy
+pnpm --filter @cf-sync/worker exec cf auth login
+pnpm --filter @cf-sync/worker exec cf deploy --secrets-file .dev.vars
 ```
 
 ### Search

@@ -5,11 +5,11 @@
 	"license": "MIT",
 	"type": "module",
 	"scripts": {
-		"build": "wrangler deploy --dry-run --outdir dist",
+		"build": "cf build",
 		"deploy": "cf deploy",
-		"dev": "wrangler dev",
+		"dev": "cf dev",
 		"test": "vitest run",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "cf workers types && tsc --noEmit"
 	},
 	"dependencies": {
 		"@cf-sync/protocol": "workspace:*",
@@ -21,7 +21,6 @@
 		"yjs": "catalog:"
 	},
 	"devDependencies": {
-		"@cloudflare/workers-types": "catalog:",
 		"cf": "1.0.0-beta.12",
 		"wrangler": "4.147.0"
 	}
