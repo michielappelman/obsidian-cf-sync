@@ -22,6 +22,8 @@ function setup() {
 	const vault = {
 		snapshot: vi.fn(async () => ({ ok: true, value: Response.json({ revision: 1 }).body! })),
 		issueTicket: vi.fn(async () => ({ ok: true, value: { ticket: "secret", expiresAt: 123 } })),
+		setWebhook: vi.fn(async () => ({ ok: true, value: undefined })),
+		removeWebhook: vi.fn(async () => ({ ok: true, value: undefined })),
 	};
 	const vaults = { getByName: vi.fn(() => vault) };
 	const search = { search: vi.fn() };
@@ -34,10 +36,10 @@ function setup() {
 	app.onError(onError);
 	const vaultId = crypto.randomUUID();
 	const deviceId = crypto.randomUUID();
-	const call = (path: string, method = "GET") =>
+	const call = (path: string, method = "GET", body?: unknown) =>
 		app.request(
 			`https://sync.test/api${path}`,
-			{ method, headers: { "X-Device-Id": deviceId } },
+			{ method, headers: { "X-Device-Id": deviceId }, body: JSON.stringify(body) },
 			env,
 		);
 
@@ -97,6 +99,29 @@ describe("Public API routes", () => {
 			url: `wss://sync.test/ws?vault=${s.vaultId}&ticket=secret`,
 			expiresAt: 123,
 		});
+	});
+
+	it("registers and removes the calling device's webhook", async () => {
+		const s = setup();
+		const webhook = { url: "https://hooks.test/push/abc", secret: "s".repeat(32) };
+
+		expect((await s.call(`/vaults/${s.vaultId}/webhook`, "PUT", webhook)).status).toBe(204);
+		expect(s.vault.setWebhook).toHaveBeenCalledExactlyOnceWith(s.deviceId, webhook);
+		expect((await s.call(`/vaults/${s.vaultId}/webhook`, "DELETE")).status).toBe(204);
+		expect(s.vault.removeWebhook).toHaveBeenCalledExactlyOnceWith(s.deviceId);
+	});
+
+	it.each([
+		{ url: "http://hooks.test/push", secret: "s".repeat(32) },
+		{ url: "not a url", secret: "s".repeat(32) },
+		{ url: "https://hooks.test/push", secret: "short" },
+		{ url: "https://hooks.test/push", secret: `${"s".repeat(32)}\r\nX-Injected: 1` },
+		{ url: "https://hooks.test/push" },
+	])("rejects the webhook %o", async (webhook) => {
+		const s = setup();
+
+		expect((await s.call(`/vaults/${s.vaultId}/webhook`, "PUT", webhook)).status).toBe(400);
+		expect(s.vault.setWebhook).not.toHaveBeenCalled();
 	});
 
 	it("scopes search to the vault and drops chunks from other vaults", async () => {

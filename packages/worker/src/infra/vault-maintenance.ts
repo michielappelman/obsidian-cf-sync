@@ -1,7 +1,7 @@
 import { FLUSH_INTERVAL_MS } from "../domain/vault-state";
 import type { VaultSockets } from "./vault-sockets";
 
-export type MaintenanceTask = "flush" | "blobs";
+export type MaintenanceTask = "flush" | "blobs" | "webhooks";
 
 export type AlarmStorage = DurableObjectStorage | DurableObjectTransaction;
 

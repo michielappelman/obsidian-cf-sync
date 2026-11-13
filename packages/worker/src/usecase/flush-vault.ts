@@ -6,6 +6,7 @@ import type { R2VaultArchive } from "../infra/r2-vault-archive";
 import type { VaultMaintenance } from "../infra/vault-maintenance";
 import type { VaultRepository } from "../infra/vault-repository";
 import type { VaultSockets } from "../infra/vault-sockets";
+import type { VaultWebhooks, WebhookNotification } from "../infra/vault-webhooks";
 
 interface FlushSnapshot {
 	meta: VaultMeta;
@@ -20,11 +21,18 @@ export class FlushVault {
 		private readonly sockets: VaultSockets,
 		private readonly archive: R2VaultArchive,
 		private readonly maintenance: VaultMaintenance,
+		private readonly webhooks: VaultWebhooks,
 		private readonly serial: <T>(action: () => Promise<T>) => Promise<T>,
 	) {}
 
 	async execute(): Promise<void> {
 		try {
+			const notification = await this.serial(() => this.takeNotification());
+
+			if (notification) {
+				await this.webhooks.notify(notification);
+			}
+
 			const snapshot = await this.serial(() => this.takeSnapshot());
 
 			if (snapshot) {
@@ -40,6 +48,18 @@ export class FlushVault {
 			console.error({ event: "vault.maintenance.failed", error: errorMessage(error) });
 			await this.serial(() => this.maintenance.retry());
 		}
+	}
+
+	// Completed before sending, so a change made while the webhooks are called notifies again.
+	private async takeNotification(): Promise<WebhookNotification | null> {
+		if (!(await this.maintenance.due("webhooks"))) {
+			return null;
+		}
+
+		await this.maintenance.complete("webhooks", null);
+		const meta = await this.repository.meta();
+
+		return { vaultId: meta.vaultId, revision: meta.revision };
 	}
 
 	private async takeSnapshot(): Promise<FlushSnapshot | null> {

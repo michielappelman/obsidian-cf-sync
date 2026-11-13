@@ -42,7 +42,11 @@ Accessは`/api/*`を保護し、同期を許可する利用者をポリシーで
 | `PUT /api/vaults/:id/exclusions`       | `{exclusions:string[]}`で共有除外を更新                               |
 | `POST /api/vaults/:id/tickets`         | 完全な接続URLと有効期限を返す                                         |
 | `GET /api/vaults/:id/search?q=&limit=` | AI SearchでVault内を検索。`{query,results:[{path,score,text}]}`を返す |
+| `PUT /api/vaults/:id/webhook`          | `{url,secret}`で端末の変更通知Webhookを登録                           |
+| `DELETE /api/vaults/:id/webhook`       | 端末の変更通知Webhookを削除                                           |
 | `GET /ws?vault=uuid&ticket=secret`     | WebSocketへ接続                                                       |
+
+変更通知Webhookは端末ごとに1件で、Vaultの変更から約10秒後に`POST <url>`へ`Authorization: Bearer <secret>`と`{vaultId,revision}`を送る。連続した変更は1回にまとめ、変更内容は含めない。送信は再試行しない。`404`・`410`の応答と端末の削除でWebhookを削除する。
 
 添付PUTには`X-Content-Digest`（SHA-256）と`X-Content-Size`（バイト数）を付ける。サーバーは内容と長さを検証し、確定した長さのストリームとしてR2へ書く。同じID・同じ内容の再送は認め、異なる内容でのID再利用を拒否する。20MBをアプリケーションの上限にはしない。
 
