@@ -1,18 +1,13 @@
+import { parseServerOrigin } from "@cf-sync/protocol";
+
 import { t } from "../i18n";
 
 export function serverOrigin(value: string): string {
-  if (!URL.canParse(value)) {
-    throw new Error(t(($) => $.errors.serverOrigin));
-  }
+	const origin = parseServerOrigin(value, { allowLocalHttp: false });
 
-  const url = new URL(value);
-  const isHttps = url.protocol === "https:";
-  const hasCredentials = Boolean(url.username || url.password);
-  const hasExtraComponents = Boolean(url.search || url.hash || url.pathname !== "/");
+	if (origin === undefined) {
+		throw new Error(t(($) => $.errors.serverOrigin));
+	}
 
-  if (!isHttps || hasCredentials || hasExtraComponents) {
-    throw new Error(t(($) => $.errors.serverOrigin));
-  }
-
-  return url.origin;
+	return origin;
 }

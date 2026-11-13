@@ -1,172 +1,173 @@
 import { ConnectionError } from "@cf-sync/sync-core/domain/connection-error";
+import {
+	calculatePKCECodeChallenge,
+	generateRandomCodeVerifier,
+	generateRandomState,
+} from "oauth4webapi";
 import * as v from "valibot";
 
 import type { AuthState } from "../../domain/auth-state";
-import { AuthenticationError } from "../../domain/authentication-error";
-import { serverOrigin } from "../../domain/server-origin";
 import { t } from "../../i18n";
 import type { Transport } from "../http/transport";
+import { registerClient } from "./oauth-provider";
 
-import { registerClient, tokenResponseSchema } from "./oauth-provider";
-import { challenge, random } from "./pkce";
+export const tokenResponseSchema = v.object({
+	access_token: v.pipe(v.string(), v.minLength(1)),
+	refresh_token: v.optional(v.pipe(v.string(), v.minLength(1))),
+	expires_in: v.pipe(v.number(), v.finite(), v.gtValue(0)),
+	token_type: v.pipe(
+		v.string(),
+		v.check((value) => value.toLowerCase() === "bearer"),
+	),
+});
 
 export class OAuthClient {
-  private refreshing?: Promise<string>;
-  private generation = 0;
-  readonly origin: string;
+	private refreshing?: Promise<string>;
+	private generation = 0;
 
-  constructor(
-    origin: string,
-    readonly state: AuthState,
-    private readonly transport: Transport,
-    private readonly save: () => Promise<void>,
-  ) {
-    this.origin = serverOrigin(origin);
-  }
+	constructor(
+		readonly origin: string,
+		readonly state: AuthState,
+		private readonly transport: Transport,
+		private readonly save: () => Promise<void>,
+	) {}
 
-  async begin(): Promise<string> {
-    this.generation++;
-    const registration = await registerClient(this.origin, this.transport);
-    this.state.registration = registration;
-    this.state.pending = { state: random(), verifier: random(), createdAt: Date.now() };
-    await this.save();
+	async begin(): Promise<string> {
+		this.generation++;
+		const registration = await registerClient(this.origin, this.transport);
+		this.state.registration = registration;
+		this.state.pending = {
+			state: generateRandomState(),
+			verifier: generateRandomCodeVerifier(),
+			createdAt: Date.now(),
+		};
+		await this.save();
 
-    const url = new URL(registration.metadata.authorization_endpoint);
-    url.search = new URLSearchParams({
-      response_type: "code",
-      client_id: registration.clientId,
-      redirect_uri: `${this.origin}/oauth/callback`,
-      state: this.state.pending.state,
-      code_challenge: await challenge(this.state.pending.verifier),
-      code_challenge_method: "S256",
-      resource: registration.resource,
-    }).toString();
+		const url = new URL(registration.metadata.authorization_endpoint);
+		url.search = new URLSearchParams({
+			response_type: "code",
+			client_id: registration.clientId,
+			redirect_uri: `${this.origin}/oauth/callback`,
+			state: this.state.pending.state,
+			code_challenge: await calculatePKCECodeChallenge(this.state.pending.verifier),
+			code_challenge_method: "S256",
+			resource: registration.resource,
+		}).toString();
 
-    return url.href;
-  }
+		return url.href;
+	}
 
-  async finish(params: Record<string, string>): Promise<void> {
-    const pending = this.state.pending;
+	async finish(params: Record<string, string>): Promise<void> {
+		const pending = this.state.pending;
+		const { state, code, error } = params;
 
-    if (!pending || !params["state"]) {
-      throw new AuthenticationError(t(($) => $.errors.loginExpired));
-    }
+		if (!pending) {
+			throw new Error(t(($) => $.errors.loginExpired));
+		}
 
-    const stateMatches = params["state"] === pending.state;
-    const isExpired = Date.now() - pending.createdAt > 10 * 60_000;
+		const stateMatches = state === pending.state;
+		const isExpired = Date.now() - pending.createdAt > 10 * 60_000;
 
-    if (!stateMatches || isExpired) {
-      throw new AuthenticationError(t(($) => $.errors.loginExpired));
-    }
+		if (!stateMatches || isExpired) {
+			throw new Error(t(($) => $.errors.loginExpired));
+		}
 
-    delete this.state.pending;
-    await this.save();
+		delete this.state.pending;
+		await this.save();
 
-    if (params["error"] || !params["code"]) {
-      throw new AuthenticationError(t(($) => $.errors.loginDenied));
-    }
+		const isDenied = error !== undefined && error !== "";
 
-    await this.exchange({
-      grant_type: "authorization_code",
-      code: params["code"],
-      redirect_uri: `${this.origin}/oauth/callback`,
-      code_verifier: pending.verifier,
-    });
-  }
+		if (isDenied || code === undefined || code === "") {
+			throw new Error(t(($) => $.errors.loginDenied));
+		}
 
-  async token(): Promise<string> {
-    const tokens = this.state.tokens;
+		await this.exchange({
+			grant_type: "authorization_code",
+			code,
+			redirect_uri: `${this.origin}/oauth/callback`,
+			code_verifier: pending.verifier,
+		});
+	}
 
-    if (!tokens) {
-      throw new AuthenticationError(t(($) => $.errors.loginRequired));
-    }
+	async token(): Promise<string> {
+		const tokens = this.state.tokens;
 
-    if (tokens.expiresAt > Date.now() + 60_000) {
-      return tokens.accessToken;
-    }
+		if (!tokens) {
+			throw new Error(t(($) => $.errors.loginRequired));
+		}
 
-    if (!this.refreshing) {
-      this.refreshing = this.exchange({
-        grant_type: "refresh_token",
-        refresh_token: tokens.refreshToken,
-      }).finally(() => {
-        this.refreshing = undefined;
-      });
-    }
+		if (tokens.expiresAt > Date.now() + 60_000) {
+			return tokens.accessToken;
+		}
 
-    return this.refreshing;
-  }
+		this.refreshing ??= this.exchange({
+			grant_type: "refresh_token",
+			refresh_token: tokens.refreshToken,
+		}).finally(() => {
+			this.refreshing = undefined;
+		});
 
-  async logout(): Promise<void> {
-    this.generation++;
-    delete this.state.tokens;
-    delete this.state.pending;
-    await this.save();
-  }
+		return await this.refreshing;
+	}
 
-  private async requestToken(parameters: Record<string, string>) {
-    const registration = this.state.registration;
+	async logout(): Promise<void> {
+		this.generation++;
+		delete this.state.tokens;
+		delete this.state.pending;
+		await this.save();
+	}
 
-    if (!registration) {
-      throw new AuthenticationError(t(($) => $.errors.startLogin));
-    }
+	private async exchange(parameters: Record<string, string>): Promise<string> {
+		const registration = this.state.registration;
 
-    return this.transport({
-      url: registration.metadata.token_endpoint,
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        ...parameters,
-        client_id: registration.clientId,
-        resource: registration.resource,
-      }).toString(),
-    });
-  }
+		if (!registration) {
+			throw new Error(t(($) => $.errors.startLogin));
+		}
 
-  private async exchange(parameters: Record<string, string>): Promise<string> {
-    const generation = this.generation;
-    const response = await this.requestToken(parameters).catch((cause: unknown) => {
-      if (cause instanceof AuthenticationError) {
-        throw cause;
-      }
+		const generation = this.generation;
+		const response = await this.transport({
+			url: registration.metadata.token_endpoint,
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({
+				...parameters,
+				client_id: registration.clientId,
+				resource: registration.resource,
+			}).toString(),
+		}).catch((cause: unknown) => {
+			throw new ConnectionError(
+				t(($) => $.errors.authUnavailable),
+				{ cause },
+			);
+		});
 
-      throw new ConnectionError(
-        t(($) => $.errors.authUnavailable),
-        { cause },
-      );
-    });
+		if (generation !== this.generation) {
+			throw new Error(t(($) => $.errors.loginChanged));
+		}
 
-    if (generation !== this.generation) {
-      throw new AuthenticationError(t(($) => $.errors.loginChanged));
-    }
+		if (response.status !== 200) {
+			if (response.status === 400 || response.status === 401) {
+				await this.logout();
+				throw new Error(t(($) => $.errors.sessionExpired));
+			}
 
-    if (response.status !== 200) {
-      if (response.status === 400 || response.status === 401) {
-        await this.logout();
-        throw new AuthenticationError(t(($) => $.errors.sessionExpired));
-      }
+			throw new ConnectionError(t(($) => $.errors.tokenFailed, { status: response.status }));
+		}
 
-      throw new ConnectionError(t(($) => $.errors.tokenFailed, { status: response.status }));
-    }
+		const result = v.parse(tokenResponseSchema, JSON.parse(response.text));
+		const refreshToken = result.refresh_token ?? this.state.tokens?.refreshToken;
 
-    const result = v.parse(tokenResponseSchema, JSON.parse(response.text));
-    const refreshToken = result.refresh_token ?? this.state.tokens?.refreshToken;
+		if (refreshToken === undefined) {
+			throw new Error(t(($) => $.errors.missingRefreshToken));
+		}
 
-    if (!refreshToken) {
-      throw new AuthenticationError(t(($) => $.errors.missingRefreshToken));
-    }
+		this.state.tokens = {
+			accessToken: result.access_token,
+			refreshToken,
+			expiresAt: Date.now() + result.expires_in * 1000,
+		};
+		await this.save();
 
-    if (generation !== this.generation) {
-      throw new AuthenticationError(t(($) => $.errors.loginChanged));
-    }
-
-    this.state.tokens = {
-      accessToken: result.access_token,
-      refreshToken,
-      expiresAt: Date.now() + result.expires_in * 1000,
-    };
-    await this.save();
-
-    return result.access_token;
-  }
+		return result.access_token;
+	}
 }

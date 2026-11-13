@@ -4,13 +4,13 @@
 
 ## 認証と接続
 
-Accessは`/api/*`を保護する。WorkerはJWTの署名・issuer・audience・所有者を検証する。Account DOが端末とVaultの登録を管理し、Vault DOが同期状態を管理する。Workerは端末とVaultの登録を確認し、検証済みの識別子をDOのRPCメソッドへ渡す。DOでも端末失効を確認する。
+Accessは`/api/*`を保護し、同期を許可する利用者をポリシーで制限する。WorkerはJWTの署名・issuer・audience・有効期限・`sub`を検証し、emailは照合しない。Account DOが端末とVaultの登録を管理し、Vault DOが同期状態を管理する。Workerは端末とVaultの登録を確認してから、Vault IDを名前としてVault DOを取得し、検証済みの端末IDをRPCメソッドへ渡す。Vault DOは自身の名前でVaultを特定し、端末の登録を確認しない。
 
 `/oauth/callback`は公開HTTPS中間ページから認可コードとstateをObsidianへ戻す。プラグインはPKCE verifierでコードを交換する。外部ブラウザとObsidianでCookieを共有する前提は置かない。
 
-`/ws`はAccessの通常ログインを通さず、WorkerとDOが接続券を検証する。接続券は端末・Vaultに紐づき、30秒間有効で一度だけ使える。接続後の時間制限は設けず、Accessの認証期限だけでは既存接続を切断しない。端末失効時は既存接続も閉じる。HTTP操作と再接続には認証が必要である。
+`/ws`はAccessの通常ログインを通さず、WorkerとDOが接続券を検証する。接続券は端末・Vaultに紐づき、30秒間有効で一度だけ使える。接続後の時間制限は設けず、Accessの認証期限だけでは既存接続を切断しない。端末の削除時は既存接続を閉じ、未使用の接続券を破棄する。HTTP操作と再接続には認証が必要である。
 
-WebSocketはサーバーからの変更通知に使う。編集は250ms単位でHTTPへまとめ、通知を受けた端末はメタデータと本文を取得する。添付データをWebSocketには流さない。
+接続中は既存ノートの本文編集をWebSocketの`operation`で送り、DOへの永続保存後に`operation-result`で受理を通知する。新規作成・移動・削除・添付の操作はHTTPで送る。本文の編集差分は`text`通知で他端末へ届け、それ以外の変更は`changed`通知を受けた端末がメタデータと本文を取得する。添付データをWebSocketには流さない。
 
 無操作時の定期同期・heartbeat・強制再接続は行わない。ローカル編集・変更通知・起動・アプリ復帰・オンライン復帰・手動操作を契機に同期する。再接続ではWebSocketを開いてからsnapshotを取得し、その間の通知も処理する。通信失敗や切断を検知したときだけ、間隔を延ばして再試行する。
 
@@ -18,19 +18,20 @@ WebSocketはサーバーからの変更通知に使う。編集は250ms単位で
 
 ## WorkerとDOの内部通信
 
-公開APIはHonoで認証・入力検証・HTTP応答を扱い、Account DOとVault DOの型付きRPCメソッドを呼ぶ。端末失効のDO間通知もRPCを使う。WebSocketのUpgradeだけはDOの`fetch`へ渡す。
+公開APIはHonoで認証・入力検証・HTTP応答を扱い、Account DOとVault DOの型付きRPCメソッドを呼ぶ。端末削除のDO間通知もRPCを使う。WebSocketのUpgradeだけはDOの`fetch`へ渡す。
 
-編集データ・全文・スナップショット・添付はRPCのストリームで渡し、通常のRPCシリアライズ上限に制限されないようにする。登録・失効・保存競合などの業務エラーは種類とメッセージを結果に含め、公開APIでHTTPステータスへ変換する。
+編集データ・全文・スナップショット・添付はRPCのストリームで渡し、通常のRPCシリアライズ上限に制限されないようにする。登録・認可・保存競合などの業務エラーは種類とメッセージを結果に含め、公開APIでHTTPステータスへ変換する。
 
 ## HTTP API
 
-下表のパスは設定したサーバーオリジンを起点とする。Vault APIには`X-Device-Id`が必須で、未登録・失効済み端末を拒否する。
+下表のパスは設定したサーバーオリジンを起点とする。Vault APIには`X-Device-Id`が必須で、未登録の端末を403で拒否する。
 
 | メソッドとパス                         | 入力・結果                                                            |
 | -------------------------------------- | --------------------------------------------------------------------- |
-| `POST /api/devices`                    | `{id,name}`で端末を登録。失効したIDは再登録不可                       |
+| `POST /api/devices`                    | `{id,name}`で端末を登録。削除したIDも再登録できる                     |
 | `GET /api/devices`                     | 端末一覧                                                              |
-| `DELETE /api/devices/:id`              | 端末を失効し、各Vaultの接続も閉じる                                   |
+| `PATCH /api/devices/:id`               | `{name}`で端末名を変更。削除した端末は403で拒否する                   |
+| `DELETE /api/devices/:id`              | 端末を削除し、各Vaultの接続と未使用の接続券も破棄する                 |
 | `GET /api/vaults`                      | Vault一覧                                                             |
 | `POST /api/vaults`                     | `{id,name}`でVaultを作成                                              |
 | `GET /api/vaults/:id/snapshot`         | 全ファイルのメタデータ、除外、保存進捗                                |

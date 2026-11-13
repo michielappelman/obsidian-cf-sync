@@ -1,233 +1,267 @@
 import type { Device, Snapshot, VaultInfo } from "@cf-sync/protocol";
-import { Setting, type App, type SettingDefinitionItem } from "obsidian";
+import type { App, Setting, SettingDefinitionItem, SettingGroupItem } from "obsidian";
 
 import { t } from "../../i18n";
-import type { ApiClient } from "../../infra/http/api-client";
 import type { PluginController } from "../plugin-controller";
 
+/** Remote values cached across re-renders, because setting definitions are built synchronously. */
+export class RemoteValue<T> {
+	value: T | undefined;
+	private loading: Promise<void> | undefined;
+
+	constructor(private readonly load: () => Promise<T>) {}
+
+	request(controller: PluginController, loaded: () => void): () => void {
+		let active = true;
+		this.loading ??= controller
+			.run(async () => {
+				this.value = await this.load();
+			})
+			.finally(() => {
+				this.loading = undefined;
+			});
+		void this.loading.then(() => {
+			if (active && this.value !== undefined) {
+				loaded();
+			}
+		});
+
+		return () => {
+			active = false;
+		};
+	}
+
+	clear(): void {
+		this.value = undefined;
+	}
+}
+
+export interface RemoteValues {
+	devices: RemoteValue<Device[]>;
+	snapshot: RemoteValue<Snapshot>;
+}
+
+export function remoteValues(controller: PluginController): RemoteValues {
+	return {
+		devices: new RemoteValue(() => controller.account().devices()),
+		snapshot: new RemoteValue(() => controller.api().snapshot()),
+	};
+}
+
 export function remoteSettingDefinitions(
-  app: App,
-  controller: PluginController,
-  refresh: () => void,
+	app: App,
+	controller: PluginController,
+	values: RemoteValues,
+	refresh: () => void,
+	update: () => void,
 ): SettingDefinitionItem[] {
-  const definitions: SettingDefinitionItem[] = [
-    {
-      name: t(($) => $.ui.remoteVault),
-      desc: t(($) => $.ui.remoteVaultDescription),
-      render: (setting) =>
-        renderAsync(
-          controller,
-          () => controller.api().vaults(),
-          (vaults) => renderVaultSelection(setting, controller, refresh, vaults),
-        ),
-    },
-    {
-      name: t(($) => $.ui.createRemoteVault),
-      render: (setting) => renderCreateVault(setting, controller, refresh, controller.api()),
-    },
-    {
-      name: t(($) => $.ui.devices),
-      render: (setting) =>
-        renderRows(
-          setting,
-          controller,
-          () => controller.api().devices(),
-          (container, devices) => renderDevices(container, controller, refresh, devices),
-        ),
-    },
-  ];
+	const definitions: SettingDefinitionItem[] = [
+		{
+			name: t(($) => $.ui.remoteVault),
+			desc: t(($) => $.ui.remoteVaultDescription),
+			render: (setting) =>
+				renderAsync(
+					controller,
+					() => controller.account().vaults(),
+					(vaults) => renderVaultSelection(setting, controller, refresh, vaults),
+				),
+		},
+		{
+			name: t(($) => $.ui.createRemoteVault),
+			render: (setting) => renderCreateVault(setting, controller, refresh),
+		},
+		{
+			type: "list",
+			heading: t(($) => $.ui.devices),
+			items: remoteItems(controller, values.devices, update, (devices) =>
+				devices.map((device) => deviceItem(device, controller, refresh)),
+			),
+		},
+	];
 
-  if (controller.config.vaultId) {
-    definitions.push(...snapshotSettingDefinitions(app, controller, refresh));
-  }
+	if (controller.config.vaultId) {
+		definitions.push(
+			...snapshotSettingDefinitions(app, controller, values.snapshot, refresh, update),
+		);
+	}
 
-  return definitions;
+	return definitions;
 }
 
 function snapshotSettingDefinitions(
-  app: App,
-  controller: PluginController,
-  refresh: () => void,
+	app: App,
+	controller: PluginController,
+	snapshot: RemoteValue<Snapshot>,
+	refresh: () => void,
+	update: () => void,
 ): SettingDefinitionItem[] {
-  let snapshot: Promise<Snapshot> | undefined;
-  const loadSnapshot = () => {
-    snapshot ??= controller
-      .api()
-      .snapshot()
-      .finally(() => {
-        snapshot = undefined;
-      });
-    return snapshot;
-  };
-  return [
-    {
-      name: t(($) => $.ui.excludedPaths),
-      desc: t(($) => $.ui.excludedPathsDescription),
-      render: (setting) =>
-        renderAsync(controller, loadSnapshot, (value) =>
-          renderExclusions(setting, controller, refresh, value),
-        ),
-    },
-    {
-      name: t(($) => $.ui.conflictFiles),
-      render: (setting) =>
-        renderRows(setting, controller, loadSnapshot, (container, value) =>
-          renderConflicts(container, app, value),
-        ),
-    },
-  ];
+	return [
+		{
+			name: t(($) => $.ui.excludedPaths),
+			desc: t(($) => $.ui.excludedPathsDescription),
+			render: (setting) => {
+				if (snapshot.value === undefined) {
+					return snapshot.request(controller, update);
+				}
+
+				renderExclusions(setting, controller, refresh, snapshot.value);
+				return undefined;
+			},
+		},
+		{
+			type: "list",
+			heading: t(($) => $.ui.conflictFiles),
+			emptyState: t(($) => $.ui.noConflictFiles),
+			items: remoteItems(controller, snapshot, update, (value) =>
+				value.files.filter((file) => file.conflict).map((file) => conflictItem(app, file.path)),
+			),
+		},
+	];
+}
+
+/** Settings search also builds definitions, so loading starts only when the placeholder row renders. */
+function remoteItems<T>(
+	controller: PluginController,
+	remote: RemoteValue<T>,
+	update: () => void,
+	items: (value: T) => SettingGroupItem[],
+): SettingGroupItem[] {
+	if (remote.value !== undefined) {
+		return items(remote.value);
+	}
+
+	return [
+		{
+			name: t(($) => $.ui.loading),
+			searchable: false,
+			render: () => remote.request(controller, update),
+		},
+	];
+}
+
+function deviceItem(
+	device: Device,
+	controller: PluginController,
+	refresh: () => void,
+): SettingGroupItem {
+	return {
+		name: device.name,
+		desc: device.id,
+		render: (setting) => {
+			setting.addButton((button) =>
+				button.setButtonText(t(($) => $.ui.deleteDevice)).onClick(() => {
+					void controller.run(async () => {
+						await controller.deleteDevice(device.id);
+						refresh();
+					});
+				}),
+			);
+		},
+	};
+}
+
+function conflictItem(app: App, path: string): SettingGroupItem {
+	return {
+		name: path,
+		render: (setting) => {
+			setting.addButton((button) =>
+				button.setButtonText(t(($) => $.ui.open)).onClick(() => {
+					void app.workspace.openLinkText(path, "");
+				}),
+			);
+		},
+	};
 }
 
 function renderAsync<T>(
-  controller: PluginController,
-  load: () => Promise<T>,
-  render: (value: T) => void,
+	controller: PluginController,
+	load: () => Promise<T>,
+	render: (value: T) => void,
 ): () => void {
-  let active = true;
-  void controller.run(async () => {
-    const value = await load();
-    if (active) {
-      render(value);
-    }
-  });
-  return () => {
-    active = false;
-  };
-}
-
-function renderRows<T>(
-  setting: Setting,
-  controller: PluginController,
-  load: () => Promise<T>,
-  render: (container: HTMLElement, value: T) => void,
-): () => void {
-  setting.setHeading();
-  const container = setting.settingEl.ownerDocument.createElement("div");
-  setting.settingEl.after(container);
-  const cleanup = renderAsync(controller, load, (value) => render(container, value));
-  return () => {
-    cleanup();
-    container.remove();
-  };
+	let active = true;
+	void controller.run(async () => {
+		const value = await load();
+		if (active) {
+			render(value);
+		}
+	});
+	return () => {
+		active = false;
+	};
 }
 
 function renderVaultSelection(
-  setting: Setting,
-  controller: PluginController,
-  refresh: () => void,
-  vaults: VaultInfo[],
+	setting: Setting,
+	controller: PluginController,
+	refresh: () => void,
+	vaults: VaultInfo[],
 ) {
-  setting.addDropdown((dropdown) => {
-    dropdown.addOption(
-      "",
-      t(($) => $.ui.selectVault),
-    );
+	setting.addDropdown((dropdown) => {
+		dropdown.addOption(
+			"",
+			t(($) => $.ui.selectVault),
+		);
 
-    for (const vault of vaults) {
-      dropdown.addOption(vault.id, vault.name);
-    }
+		for (const vault of vaults) {
+			dropdown.addOption(vault.id, vault.name);
+		}
 
-    dropdown.setValue(controller.config.vaultId);
-    dropdown.setDisabled(Boolean(controller.config.vaultId));
-    dropdown.onChange((id) =>
-      controller.run(async () => {
-        await controller.selectVault(id);
-        refresh();
-      }),
-    );
-  });
+		dropdown.setValue(controller.config.vaultId);
+		dropdown.setDisabled(Boolean(controller.config.vaultId));
+		dropdown.onChange((id) =>
+			controller.run(async () => {
+				await controller.selectVault(id);
+				refresh();
+			}),
+		);
+	});
 }
 
-function renderCreateVault(
-  setting: Setting,
-  controller: PluginController,
-  refresh: () => void,
-  api: ApiClient,
-) {
-  let name = "";
-  setting
-    .addText((input) =>
-      input.onChange((value) => {
-        name = value.trim();
-      }),
-    )
-    .addButton((button) =>
-      button.setButtonText(t(($) => $.ui.create)).onClick(() => {
-        void controller.run(async () => {
-          if (!name) {
-            throw new Error(t(($) => $.ui.vaultNameRequired));
-          }
+function renderCreateVault(setting: Setting, controller: PluginController, refresh: () => void) {
+	let name = "";
+	setting
+		.addText((input) =>
+			input.onChange((value) => {
+				name = value.trim();
+			}),
+		)
+		.addButton((button) =>
+			button.setButtonText(t(($) => $.ui.create)).onClick(() => {
+				void controller.run(async () => {
+					if (!name) {
+						throw new Error(t(($) => $.ui.vaultNameRequired));
+					}
 
-          await api.createVault(name);
-          refresh();
-        });
-      }),
-    );
-}
-
-function renderDevices(
-  remote: HTMLElement,
-  controller: PluginController,
-  refresh: () => void,
-  devices: Device[],
-) {
-  for (const device of devices) {
-    let description = device.id;
-
-    if (device.revoked) {
-      description += ` / ${t(($) => $.ui.revoked)}`;
-    }
-
-    new Setting(remote)
-      .setName(device.name)
-      .setDesc(description)
-      .addButton((button) =>
-        button
-          .setButtonText(t(($) => $.ui.revoke))
-          .setDisabled(device.revoked)
-          .onClick(() => {
-            void controller.run(async () => {
-              await controller.revokeDevice(device.id);
-              refresh();
-            });
-          }),
-      );
-  }
+					await controller.account().createVault(name);
+					refresh();
+				});
+			}),
+		);
 }
 
 function renderExclusions(
-  setting: Setting,
-  controller: PluginController,
-  refresh: () => void,
-  snapshot: Snapshot,
+	setting: Setting,
+	controller: PluginController,
+	refresh: () => void,
+	snapshot: Snapshot,
 ) {
-  let exclusions = snapshot.exclusions.join("\n");
-  setting
-    .addTextArea((input) =>
-      input.setValue(exclusions).onChange((value) => {
-        exclusions = value;
-      }),
-    )
-    .addButton((button) =>
-      button.setButtonText(t(($) => $.ui.save)).onClick(() => {
-        void controller.run(async () => {
-          const paths = exclusions
-            .split("\n")
-            .map((path) => path.trim())
-            .filter(Boolean);
-          await controller.saveExclusions(paths);
-          refresh();
-        });
-      }),
-    );
-}
-
-function renderConflicts(remote: HTMLElement, app: App, snapshot: Snapshot) {
-  for (const file of snapshot.files.filter((file) => file.conflict)) {
-    new Setting(remote).setName(file.path).addButton((button) =>
-      button.setButtonText(t(($) => $.ui.open)).onClick(() => {
-        void app.workspace.openLinkText(file.path, "");
-      }),
-    );
-  }
+	let exclusions = snapshot.exclusions.join("\n");
+	setting
+		.addTextArea((input) =>
+			input.setValue(exclusions).onChange((value) => {
+				exclusions = value;
+			}),
+		)
+		.addButton((button) =>
+			button.setButtonText(t(($) => $.ui.save)).onClick(() => {
+				void controller.run(async () => {
+					const paths = exclusions
+						.split("\n")
+						.map((path) => path.trim())
+						.filter(Boolean);
+					await controller.saveExclusions(paths);
+					refresh();
+				});
+			}),
+		);
 }

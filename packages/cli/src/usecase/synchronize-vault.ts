@@ -1,66 +1,72 @@
 import { realpath } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
-import { PlanSync, SyncOnce, type SyncPlan, type SyncResult } from "@cf-sync/sync-core";
+import { VaultApi } from "@cf-sync/sync-core/infra/http/server-api";
+import type { SyncPlan } from "@cf-sync/sync-core/sync/domain/sync-plan";
+import type { SyncResult } from "@cf-sync/sync-core/sync/domain/sync-result";
+import { PlanSync } from "@cf-sync/sync-core/sync/usecase/plan-sync";
+import { SyncOnce } from "@cf-sync/sync-core/sync/usecase/sync-once";
+import type { SyncOnceOptions } from "@cf-sync/sync-core/sync/usecase/sync-once-options";
 
-import { normalizeServerUrl } from "../domain/connection";
+import { normalizeServerUrl } from "../domain/binding";
 import { resolveCredentials } from "../infra/config/credentials";
 import { FileVault } from "../infra/fs/vault-adapter";
 import { metadataName, readBinding, validateMetadata } from "../infra/fs/vault-binding";
-import { RestApi } from "../infra/http/api-client";
+import { serverConnection } from "../infra/http/server-connection";
 import { SqliteStore } from "../infra/storage/sqlite-store";
 import { lockVault } from "../infra/storage/vault-lock";
 
-export interface SynchronizeOptions {
-  directory: string;
-  dryRun: boolean;
+export async function synchronizeVault(
+	directory: string,
+	env: NodeJS.ProcessEnv,
+): Promise<SyncResult> {
+	return await withVault(directory, env, false, (ports) => new SyncOnce(ports).run());
 }
 
-export type SynchronizeResult =
-  | { mode: "plan"; plan: SyncPlan }
-  | { mode: "sync"; sync: SyncResult };
+export async function planSynchronization(
+	directory: string,
+	env: NodeJS.ProcessEnv,
+): Promise<SyncPlan> {
+	return await withVault(directory, env, true, (ports) => new PlanSync(ports).run());
+}
 
-export async function synchronizeVault(
-  options: SynchronizeOptions,
-  env: NodeJS.ProcessEnv,
-): Promise<SynchronizeResult> {
-  const root = await realpath(resolve(options.directory));
-  const metadata = join(root, metadataName);
+async function withVault<T>(
+	directory: string,
+	env: NodeJS.ProcessEnv,
+	dryRun: boolean,
+	run: (ports: SyncOnceOptions) => Promise<T>,
+): Promise<T> {
+	const root = await realpath(directory);
+	const metadata = join(root, metadataName);
 
-  await validateMetadata(metadata);
-  const unlock = await lockVault(metadata);
+	await validateMetadata(metadata);
+	const unlock = lockVault(metadata);
 
-  try {
-    const binding = await readBinding(metadata);
-    const origin = normalizeServerUrl(binding.serverUrl);
-    assertSameServer(origin, env["CF_SYNC_SERVER_URL"]);
+	try {
+		const binding = await readBinding(metadata);
+		assertSameServer(binding.serverUrl, env["CF_SYNC_SERVER_URL"]);
 
-    const credentials = await resolveCredentials(origin, env);
-    const api = new RestApi(origin, credentials, binding.deviceId, binding.vaultId);
-    const store = new SqliteStore(join(metadata, "state.sqlite"), options.dryRun);
+		const credentials = await resolveCredentials(binding.serverUrl, env);
+		const server = serverConnection(binding.serverUrl, credentials);
+		const api = new VaultApi(server, binding.deviceId, binding.vaultId);
+		const store = new SqliteStore(join(metadata, "state.sqlite"), dryRun);
 
-    try {
-      const ports = { api, store, vault: new FileVault(root) };
-
-      if (options.dryRun) {
-        return { mode: "plan", plan: await new PlanSync(ports).run() };
-      }
-
-      return { mode: "sync", sync: await new SyncOnce(ports).run() };
-    } finally {
-      store.close();
-    }
-  } finally {
-    await unlock();
-  }
+		try {
+			return await run({ api, store, vault: new FileVault(root) });
+		} finally {
+			store.close();
+		}
+	} finally {
+		unlock();
+	}
 }
 
 function assertSameServer(origin: string, configured: string | undefined): void {
-  if (configured === undefined) {
-    return;
-  }
+	if (configured === undefined) {
+		return;
+	}
 
-  if (normalizeServerUrl(configured) !== origin) {
-    throw new Error("CF_SYNC_SERVER_URL differs from the initialized server");
-  }
+	if (normalizeServerUrl(configured) !== origin) {
+		throw new Error("CF_SYNC_SERVER_URL differs from the initialized server");
+	}
 }

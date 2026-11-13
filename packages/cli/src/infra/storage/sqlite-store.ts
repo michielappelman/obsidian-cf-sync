@@ -1,92 +1,106 @@
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { existsSync, rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
-import type { LocalState, StoredData, SyncStore } from "@cf-sync/sync-core";
+import type { LocalState } from "@cf-sync/sync-core/sync/domain/sync-state";
+import type { StoredData, SyncStore } from "@cf-sync/sync-core/sync/ports/sync-store";
+
+const SIDECAR_SUFFIXES = ["-wal", "-shm"];
 
 export class SqliteStore implements SyncStore {
-  private readonly db: DatabaseSync;
-  private readonly temporary: string | undefined;
+	private readonly db: DatabaseSync;
+	private readonly createdSidecars: string[] = [];
 
-  constructor(path: string, dryRun = false) {
-    if (dryRun && existsSync(path)) {
-      this.temporary = mkdtempSync(join(tmpdir(), "cf-sync-plan-"));
-      const copy = join(this.temporary, "state.sqlite");
+	constructor(path: string, dryRun = false) {
+		if (dryRun) {
+			this.createdSidecars = SIDECAR_SUFFIXES.map((suffix) => path + suffix).filter(
+				(sidecar) => !existsSync(sidecar),
+			);
+		}
 
-      copyFileSync(path, copy);
+		this.db = openDatabase(path, dryRun);
+	}
 
-      if (existsSync(path + "-wal")) {
-        copyFileSync(path + "-wal", copy + "-wal");
-      }
+	load(): Promise<LocalState | undefined> {
+		const row = this.db.prepare("SELECT value FROM state WHERE id = 1").get();
 
-      this.db = new DatabaseSync(copy);
-      return;
-    }
+		if (!row) {
+			return Promise.resolve(undefined);
+		}
 
-    let databasePath = path;
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- 自分で保存したJSONで、LocalStateのスキーマ検証は未導入
+		return Promise.resolve(JSON.parse(String(row["value"])) as LocalState);
+	}
 
-    if (dryRun) {
-      databasePath = ":memory:";
-    }
+	async save(state: LocalState, data?: StoredData): Promise<void> {
+		this.db.exec("BEGIN IMMEDIATE");
 
-    this.db = new DatabaseSync(databasePath);
-    this.db.exec(`
-      PRAGMA journal_mode = WAL;
-      CREATE TABLE IF NOT EXISTS data (key TEXT PRIMARY KEY, value BLOB NOT NULL);
-      CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id = 1), value TEXT NOT NULL);
-    `);
-  }
+		try {
+			if (data) {
+				await this.put(data.key, data.value);
+			}
 
-  async load(): Promise<LocalState | undefined> {
-    const row = this.db.prepare("SELECT value FROM state WHERE id = 1").get();
+			this.db.prepare("INSERT OR REPLACE INTO state VALUES (1, ?)").run(JSON.stringify(state));
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+	}
 
-    if (!row) {
-      return undefined;
-    }
+	get(key: string): Promise<Uint8Array | undefined> {
+		const row = this.db.prepare("SELECT value FROM data WHERE key = ?").get(key);
 
-    return JSON.parse(String(row["value"])) as LocalState;
-  }
+		if (!row) {
+			return Promise.resolve(undefined);
+		}
 
-  async save(state: LocalState, data?: StoredData): Promise<void> {
-    this.db.exec("BEGIN IMMEDIATE");
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- value列はBLOB NOT NULLなので常にUint8Array
+		return Promise.resolve(row["value"] as Uint8Array);
+	}
 
-    try {
-      if (data) {
-        await this.put(data.key, data.value);
-      }
+	put(key: string, value: Uint8Array): Promise<void> {
+		this.db.prepare("INSERT OR REPLACE INTO data VALUES (?, ?)").run(key, value);
 
-      this.db.prepare("INSERT OR REPLACE INTO state VALUES (1, ?)").run(JSON.stringify(state));
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
+		return Promise.resolve();
+	}
 
-  async get(key: string): Promise<Uint8Array | undefined> {
-    const row = this.db.prepare("SELECT value FROM data WHERE key = ?").get(key);
+	delete(key: string): Promise<void> {
+		this.db.prepare("DELETE FROM data WHERE key = ?").run(key);
 
-    if (!row) {
-      return undefined;
-    }
+		return Promise.resolve();
+	}
 
-    return row["value"] as Uint8Array;
-  }
+	close(): void {
+		this.db.close();
 
-  async put(key: string, value: Uint8Array): Promise<void> {
-    this.db.prepare("INSERT OR REPLACE INTO data VALUES (?, ?)").run(key, value);
-  }
+		// A read-only connection keeps the WAL index files, and a dry run must not leave them behind.
+		for (const sidecar of this.createdSidecars) {
+			rmSync(sidecar, { force: true });
+		}
+	}
+}
 
-  async delete(key: string): Promise<void> {
-    this.db.prepare("DELETE FROM data WHERE key = ?").run(key);
-  }
+function openDatabase(path: string, dryRun: boolean): DatabaseSync {
+	if (!dryRun) {
+		return createDatabase(path);
+	}
 
-  close(): void {
-    this.db.close();
+	if (existsSync(path)) {
+		return new DatabaseSync(path, { readOnly: true });
+	}
 
-    if (this.temporary) {
-      rmSync(this.temporary, { recursive: true });
-    }
-  }
+	// A dry run before the first sync must not leave state.sqlite behind.
+	return createDatabase(":memory:");
+}
+
+function createDatabase(path: string): DatabaseSync {
+	const db = new DatabaseSync(path);
+
+	db.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS data (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+    CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id = 1), value TEXT NOT NULL);
+  `);
+
+	return db;
 }

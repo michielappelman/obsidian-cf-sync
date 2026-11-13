@@ -1,351 +1,276 @@
-import { conflictPath, digest, type DocumentResponse, type FileRecord } from "@cf-sync/protocol";
-import { toUint8Array, fromUint8Array } from "js-base64";
+import { conflictPath, digest } from "@cf-sync/protocol";
+import type { FileRecord } from "@cf-sync/protocol";
+import { fromUint8Array, toUint8Array } from "js-base64";
 import * as Y from "yjs";
 
 import { t } from "../../i18n";
+import { documentKey, incomingKey } from "../domain/storage-keys";
 import type { LocalFile } from "../domain/sync-state";
 import type { RestApiPort } from "../ports/api-port";
 import type { StoredData } from "../ports/sync-store";
 import type { VaultPort } from "../ports/vault-port";
-import type { Documents } from "../service/documents";
+import type { BorrowedDoc, Documents } from "../service/documents";
+import { adoptReceived } from "../service/snapshot-state";
 import type { SyncState } from "../service/sync-state";
-
 import type { LocalChanges } from "./local-changes";
 
-export interface ReconcileContext {
-  paths: Set<string>;
-  byId: Map<string, LocalFile>;
-  byPath: Map<string, LocalFile>;
+const encoder = new TextEncoder();
+
+export interface FetchedFile {
+	file: FileRecord;
+	content: { kind: "text"; update: string } | { kind: "blob"; bytes: Uint8Array };
+}
+
+interface DiskFile {
+	bytes: Uint8Array;
+	digest: string;
 }
 
 interface PreparedContent {
-  bytes: Uint8Array;
-  update: string | null;
-  doc: Y.Doc | undefined;
-  wasOpen: boolean;
+	bytes: Uint8Array;
+	digest: string;
+	update: string | null;
+	borrowed: BorrowedDoc | undefined;
 }
 
 export class ReceiveFile {
-  constructor(
-    private readonly state: SyncState,
-    private readonly vault: VaultPort,
-    private readonly api: RestApiPort,
-    private readonly documents: Documents,
-    private readonly changes: LocalChanges,
-  ) {}
+	constructor(
+		private readonly state: SyncState,
+		private readonly vault: VaultPort,
+		private readonly api: RestApiPort,
+		private readonly documents: Documents,
+		private readonly changes: LocalChanges,
+	) {}
 
-  async fetch(fileId: string) {
-    const document = await this.api.document(fileId);
-    let bytes: Uint8Array | undefined;
+	async fetch(fileId: string): Promise<FetchedFile> {
+		const document = await this.api.document(fileId);
 
-    if (document.content.kind === "blob") {
-      bytes = await this.api.download(document.content.blob);
-    }
+		if (document.content.kind === "text") {
+			return { file: document.file, content: document.content };
+		}
 
-    return { document, bytes };
-  }
+		const bytes = await this.api.download(document.content.blob);
 
-  async run(
-    remote: FileRecord,
-    fetched?: DocumentResponse,
-    context?: ReconcileContext,
-    downloaded?: Uint8Array,
-  ): Promise<boolean> {
-    let existing: LocalFile | undefined;
-    if (context) {
-      existing = context.byId.get(remote.id);
-    } else {
-      existing = this.state.data.files.find((file) => file.id === remote.id);
-    }
+		return { file: document.file, content: { kind: "blob", bytes } };
+	}
 
-    if (existing && remote.revision < existing.documentRevision) {
-      return true;
-    }
+	async run(fetched: FetchedFile): Promise<boolean> {
+		const remote = fetched.file;
+		const existing = this.state.data.files.find((file) => file.id === remote.id);
 
-    const paths = context?.paths ?? new Set(await this.vault.list());
-    if (this.alreadyReceived(existing, remote)) {
-      return true;
-    }
+		if (adoptReceived(existing, remote)) {
+			return true;
+		}
 
-    if (existing && paths.has(existing.path)) {
-      const changedLocally = await this.captureChangedFile(existing);
-      if (changedLocally) {
-        return false;
-      }
-    }
+		const inEditor = this.heldByEditor(existing);
+		const disk = await this.readDisk(existing?.path ?? remote.path);
 
-    const document = fetched ?? (await this.api.document(remote.id));
-    const sourcePath = existing?.path ?? remote.path;
-    const present = new Set(await this.vault.list());
-    let expected: Uint8Array | undefined;
-    if (present.has(sourcePath)) {
-      expected = await this.vault.read(sourcePath);
-    }
+		if (await this.captureLocalChange(existing, remote, disk, inEditor)) {
+			return false;
+		}
 
-    if (await this.captureDuringFetch(existing, remote, expected)) {
-      return false;
-    }
+		const local = existing ?? { ...remote, diskDigest: remote.digest, documentRevision: 0 };
+		const content = await this.prepareContent(local, fetched);
+		if (!content) {
+			return false;
+		}
 
-    const local = existing ?? { ...remote, diskDigest: remote.digest, documentRevision: 0 };
-    const content = await this.prepareContent(local, document, downloaded);
-    if (!content) {
-      return false;
-    }
-    const occupied = await this.preparePath(local, remote, paths, context);
-    let expectedAtTarget = expected;
-    if (occupied) {
-      expectedAtTarget = undefined;
-    }
+		const occupied = await this.preparePath(local, remote);
+		// The editor may have detached while this task awaited; then the file needs the write below.
+		if (this.heldByEditor(existing)) {
+			await this.commitReceived(existing, local, fetched, content, local.diskDigest);
+			content.borrowed?.release();
 
-    await this.saveIncoming(remote, document, content, expectedAtTarget);
+			return true;
+		}
 
-    const written = await this.vault.writeIfUnchanged(remote.path, expectedAtTarget, content.bytes);
-    if (!written) {
-      await this.captureInterruptedWrite(existing, local, remote, content);
+		let expected = disk;
+		if (occupied) {
+			expected = undefined;
+		}
 
-      return false;
-    }
+		await this.saveIncoming(remote, content, expected);
 
-    await this.commitReceived(existing, local, remote, document, content, context);
-    paths.add(remote.path);
-    this.releaseContent(local, content);
-    return true;
-  }
+		const written = await this.vault.writeIfUnchanged(remote.path, expected?.bytes, content.bytes);
+		if (!written) {
+			await this.captureInterruptedWrite(existing, remote, content);
 
-  private alreadyReceived(local: LocalFile | undefined, remote: FileRecord): boolean {
-    if (!local) {
-      return false;
-    }
+			return false;
+		}
 
-    const sameContent = local.digest === remote.digest;
-    const samePath = local.path === remote.path;
-    const sameDocument = remote.kind === "blob" || local.documentRevision === remote.revision;
-    if (!sameContent || !samePath || !sameDocument) {
-      return false;
-    }
+		await this.commitReceived(existing, local, fetched, content, content.digest);
+		content.borrowed?.release();
 
-    local.revision = remote.revision;
-    local.pathRevision = remote.pathRevision;
+		return true;
+	}
 
-    return true;
-  }
+	private heldByEditor(local: LocalFile | undefined): local is LocalFile {
+		return local?.kind === "text" && this.documents.isRetained(local.id);
+	}
 
-  private async captureChangedFile(local: LocalFile): Promise<boolean> {
-    const current = await this.vault.read(local.path);
-    const diskDigest = await digest(current);
-    if (diskDigest === local.digest) {
-      return false;
-    }
+	private async readDisk(path: string): Promise<DiskFile | undefined> {
+		if (!(await this.vault.exists(path))) {
+			return undefined;
+		}
 
-    await this.changes.capture(local.path);
+		const bytes = await this.vault.read(path);
 
-    return true;
-  }
+		return { bytes, digest: await digest(bytes) };
+	}
 
-  private async captureDuringFetch(
-    local: LocalFile | undefined,
-    remote: FileRecord,
-    expected: Uint8Array | undefined,
-  ): Promise<boolean> {
-    if (!expected) {
-      if (!local) {
-        return false;
-      }
+	private async captureLocalChange(
+		local: LocalFile | undefined,
+		remote: FileRecord,
+		disk: DiskFile | undefined,
+		inEditor: boolean,
+	): Promise<boolean> {
+		if (!disk) {
+			if (!local) {
+				return false;
+			}
 
-      await this.changes.delete(local.path);
+			await this.changes.delete(local.path);
 
-      return true;
-    }
+			return true;
+		}
 
-    const diskDigest = await digest(expected);
-    if (local) {
-      if (diskDigest === local.digest) {
-        return false;
-      }
+		// The disk lags behind the editor until Obsidian saves, so it cannot show a local change.
+		if (inEditor) {
+			return false;
+		}
 
-      await this.changes.capture(local.path);
+		const baseline = local ?? remote;
+		if (disk.digest === baseline.digest) {
+			return false;
+		}
 
-      return true;
-    }
+		await this.changes.capture(baseline.path);
 
-    if (diskDigest === remote.digest) {
-      return false;
-    }
+		return true;
+	}
 
-    await this.changes.capture(remote.path);
+	private async prepareContent(
+		local: LocalFile,
+		fetched: FetchedFile,
+	): Promise<PreparedContent | undefined> {
+		if (fetched.content.kind === "blob") {
+			const bytes = fetched.content.bytes;
 
-    return true;
-  }
+			return { bytes, digest: await digest(bytes), update: null, borrowed: undefined };
+		}
 
-  private async prepareContent(
-    local: LocalFile,
-    document: DocumentResponse,
-    downloaded: Uint8Array | undefined,
-  ): Promise<PreparedContent | undefined> {
-    if (document.content.kind === "blob") {
-      return {
-        bytes: downloaded ?? (await this.api.download(document.content.blob)),
-        update: null,
-        doc: undefined,
-        wasOpen: false,
-      };
-    }
+		const borrowed = await this.documents.borrow(local);
+		const staged = new Y.Doc();
+		Y.applyUpdate(staged, Y.encodeStateAsUpdate(borrowed.doc));
+		Y.applyUpdate(staged, toUint8Array(fetched.content.update));
 
-    const wasOpen = this.documents.get(local.id) !== undefined;
-    const doc = await this.documents.open(local);
-    const staged = new Y.Doc();
-    const localUpdate = Y.encodeStateAsUpdate(doc);
-    const remoteUpdate = toUint8Array(document.content.update);
-    Y.applyUpdate(staged, localUpdate);
-    Y.applyUpdate(staged, remoteUpdate);
+		if (staged.store.pendingStructs || staged.store.pendingDs) {
+			staged.destroy();
+			borrowed.release();
 
-    if (staged.store.pendingStructs || staged.store.pendingDs) {
-      staged.destroy();
-      if (!wasOpen) {
-        this.documents.remove(local.id);
-      }
-      return undefined;
-    }
-    const mergedText = staged.getText("content").toString();
-    const bytes = new TextEncoder().encode(mergedText);
-    const update = fromUint8Array(Y.encodeStateAsUpdate(staged));
-    staged.destroy();
+			return undefined;
+		}
 
-    return { bytes, update, doc, wasOpen };
-  }
+		const bytes = encoder.encode(staged.getText("content").toString());
+		const update = fromUint8Array(Y.encodeStateAsUpdate(staged));
+		staged.destroy();
 
-  private async preparePath(
-    local: LocalFile,
-    remote: FileRecord,
-    paths: Set<string>,
-    context?: ReconcileContext,
-  ): Promise<boolean> {
-    let occupant: LocalFile | undefined;
-    if (context) {
-      occupant = context.byPath.get(remote.path);
-    } else {
-      occupant = this.state.data.files.find((file) => file.path === remote.path);
-    }
+		return { bytes, digest: await digest(bytes), update, borrowed };
+	}
 
-    if (occupant?.id === local.id) {
-      occupant = undefined;
-    }
+	private async preparePath(local: LocalFile, remote: FileRecord): Promise<boolean> {
+		let occupant = this.state.data.files.find((file) => file.path === remote.path);
+		if (occupant?.id === local.id) {
+			occupant = undefined;
+		}
 
-    if (occupant && paths.has(remote.path)) {
-      await this.protectOccupant(occupant, remote.path, paths, context);
-    }
+		if (occupant && (await this.vault.exists(remote.path))) {
+			await this.protectOccupant(occupant, remote.path);
+		}
 
-    const needsMove = local.path !== remote.path && paths.has(local.path);
-    if (needsMove) {
-      await this.vault.rename(local.path, remote.path);
-      paths.delete(local.path);
-      context?.byPath.delete(local.path);
-    }
+		const needsMove = local.path !== remote.path && (await this.vault.exists(local.path));
+		if (needsMove) {
+			await this.vault.rename(local.path, remote.path);
+		}
 
-    return occupant !== undefined;
-  }
+		return occupant !== undefined;
+	}
 
-  private async protectOccupant(
-    occupant: LocalFile,
-    path: string,
-    paths: Set<string>,
-    context?: ReconcileContext,
-  ): Promise<void> {
-    const protectedPath = conflictPath(path, crypto.randomUUID());
-    await this.vault.rename(path, protectedPath);
-    context?.byPath.delete(occupant.path);
-    occupant.path = protectedPath;
-    context?.byPath.set(protectedPath, occupant);
-    paths.delete(path);
-    paths.add(protectedPath);
-    for (const pending of this.state.data.pending) {
-      if (pending.fileId === occupant.id && "path" in pending) {
-        pending.path = protectedPath;
-      }
-    }
-  }
+	private async protectOccupant(occupant: LocalFile, path: string): Promise<void> {
+		const protectedPath = conflictPath(path, crypto.randomUUID());
+		await this.vault.rename(path, protectedPath);
+		occupant.path = protectedPath;
 
-  private async saveIncoming(
-    remote: FileRecord,
-    document: DocumentResponse,
-    content: PreparedContent,
-    expected: Uint8Array | undefined,
-  ): Promise<void> {
-    const receivedDigest = await digest(content.bytes);
-    let expectedDigest: string | null = null;
-    if (expected) {
-      expectedDigest = await digest(expected);
-    }
+		for (const pending of this.state.data.pending) {
+			if (pending.fileId === occupant.id && "path" in pending) {
+				pending.path = protectedPath;
+			}
+		}
+	}
 
-    this.state.data.incoming = {
-      file: { ...remote, revision: document.file.revision },
-      digest: receivedDigest,
-      expectedDigest,
-      update: content.update,
-    };
-    await this.state.store.save(this.state.data, { key: "incoming", value: content.bytes });
-  }
+	private async saveIncoming(
+		remote: FileRecord,
+		content: PreparedContent,
+		expected: DiskFile | undefined,
+	): Promise<void> {
+		this.state.data.incoming = {
+			file: remote,
+			digest: content.digest,
+			expectedDigest: expected?.digest ?? null,
+			update: content.update,
+		};
+		await this.state.persist({ key: incomingKey, value: content.bytes });
+	}
 
-  private async captureInterruptedWrite(
-    existing: LocalFile | undefined,
-    local: LocalFile,
-    remote: FileRecord,
-    content: PreparedContent,
-  ): Promise<void> {
-    await this.state.store.save({ ...this.state.data, incoming: null });
-    this.state.data.incoming = null;
-    this.releaseContent(local, content);
-    // The staged remote state was never applied; capture against the unchanged baseline.
-    if (existing && existing.path !== remote.path) {
-      existing.path = remote.path;
-    }
+	private async captureInterruptedWrite(
+		existing: LocalFile | undefined,
+		remote: FileRecord,
+		content: PreparedContent,
+	): Promise<void> {
+		await this.state.clearIncoming();
+		content.borrowed?.release();
+		// The staged remote state was never applied; capture against the unchanged baseline.
+		if (existing) {
+			existing.path = remote.path;
+		}
 
-    await this.changes.capture(remote.path);
-  }
+		await this.changes.capture(remote.path);
+	}
 
-  private async commitReceived(
-    existing: LocalFile | undefined,
-    local: LocalFile,
-    remote: FileRecord,
-    document: DocumentResponse,
-    content: PreparedContent,
-    context?: ReconcileContext,
-  ): Promise<void> {
-    if (!existing) {
-      this.state.data.files.push(local);
-    }
+	private async commitReceived(
+		existing: LocalFile | undefined,
+		local: LocalFile,
+		fetched: FetchedFile,
+		content: PreparedContent,
+		diskDigest: string,
+	): Promise<void> {
+		const remote = fetched.file;
+		if (!existing) {
+			this.state.data.files.push(local);
+		}
 
-    if (content.doc && document.content.kind === "text") {
-      Y.applyUpdate(content.doc, toUint8Array(document.content.update), "remote");
-    }
+		const doc = content.borrowed?.doc;
+		if (doc && fetched.content.kind === "text") {
+			Y.applyUpdate(doc, toUint8Array(fetched.content.update), "remote");
+		}
 
-    context?.byId.set(local.id, local);
-    context?.byPath.set(remote.path, local);
-    const materializedDigest = await digest(content.bytes);
-    Object.assign(local, remote, {
-      digest: materializedDigest,
-      diskDigest: materializedDigest,
-      documentRevision: document.file.revision,
-    });
-    if (remote.conflict) {
-      this.state.reportConflict(
-        remote,
-        t(($) => $.sync.conflictReceived),
-      );
-    }
+		Object.assign(local, remote, {
+			digest: content.digest,
+			diskDigest,
+			documentRevision: remote.revision,
+		});
+		if (remote.conflict) {
+			this.state.reportConflict(
+				remote,
+				t(($) => $.sync.conflictReceived),
+			);
+		}
 
-    let receivedData: StoredData | undefined;
-    if (content.doc) {
-      receivedData = { key: `doc:${local.id}`, value: Y.encodeStateAsUpdate(content.doc) };
-    }
+		let receivedData: StoredData | undefined;
+		if (doc) {
+			receivedData = { key: documentKey(local.id), value: Y.encodeStateAsUpdate(doc) };
+		}
 
-    await this.state.store.save({ ...this.state.data, incoming: null }, receivedData);
-    this.state.data.incoming = null;
-  }
-
-  private releaseContent(local: LocalFile, content: PreparedContent): void {
-    if (content.doc && !content.wasOpen) {
-      this.documents.remove(local.id);
-    }
-  }
+		await this.state.clearIncoming(receivedData);
+	}
 }

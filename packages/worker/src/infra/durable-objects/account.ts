@@ -1,71 +1,73 @@
 import type { Device, VaultInfo } from "@cf-sync/protocol";
 import { DurableObject } from "cloudflare:workers";
 
-import { ApplicationError } from "../../domain/errors";
-import { revokeDevice } from "../../usecase/revoke-device";
 import { AccountRepository } from "../account-repository";
-import { DurableObjectDeviceConnections } from "../device-connections";
 import type { Env } from "../env";
-import { rpcResult, type RpcResult } from "../rpc-result";
+import { rpcResult, unwrapRpcResult } from "../rpc-result";
+import type { RpcResult } from "../rpc-result";
 
 export class Account extends DurableObject<Env> {
-  private readonly repository: AccountRepository;
-  private readonly connections: DurableObjectDeviceConnections;
+	private readonly repository: AccountRepository;
 
-  constructor(state: DurableObjectState, env: Env) {
-    super(state, env);
+	constructor(state: DurableObjectState, env: Env) {
+		super(state, env);
 
-    this.repository = new AccountRepository(state.storage);
-    this.connections = new DurableObjectDeviceConnections(env.VAULTS);
-  }
+		this.repository = new AccountRepository(state.storage);
+	}
 
-  devices(): Promise<RpcResult<Device[]>> {
-    return rpcResult(() => this.repository.devices());
-  }
+	devices(): Promise<RpcResult<Device[]>> {
+		return rpcResult(() => this.repository.devices());
+	}
 
-  registerDevice(input: { id: string; name: string }): Promise<RpcResult<Device>> {
-    return rpcResult(async () => {
-      const device = await this.repository.registerDevice(input);
-      console.info({ event: "device.registered", deviceId: device.id });
+	registerDevice(input: { id: string; name: string }): Promise<RpcResult<Device>> {
+		return rpcResult(async () => {
+			const device = await this.repository.registerDevice(input);
+			console.info({ event: "device.registered", deviceId: device.id });
 
-      return device;
-    });
-  }
+			return device;
+		});
+	}
 
-  device(id: string): Promise<RpcResult<Device>> {
-    return rpcResult(async () => {
-      const device = await this.repository.device(id);
+	renameDevice(device: Device): Promise<RpcResult<Device>> {
+		return rpcResult(() => this.repository.renameDevice(device));
+	}
 
-      if (device.revoked) {
-        throw new ApplicationError("forbidden", "Device revoked");
-      }
+	authorizeVaultAccess(deviceId: string, vaultId: string): Promise<RpcResult<void>> {
+		return rpcResult(async () => {
+			await this.repository.assertDevice(deviceId);
+			await this.repository.vault(vaultId);
+		});
+	}
 
-      return device;
-    });
-  }
+	deleteDevice(id: string): Promise<RpcResult<void>> {
+		return rpcResult(async () => {
+			await this.repository.deleteDevice(id);
 
-  revokeDevice(id: string): Promise<RpcResult<void>> {
-    return rpcResult(async () => {
-      const device = await this.repository.device(id);
-      await revokeDevice(device, this.repository, this.connections);
-      console.info({ event: "device.revoked", deviceId: id });
-    });
-  }
+			const vaults = await this.repository.vaults();
+			await Promise.all(
+				vaults.map(async (vault) => {
+					const result = await this.env.VAULTS.getByName(vault.id).removeDevice(id);
+					unwrapRpcResult(result);
+				}),
+			);
+			console.info({ event: "device.deleted", deviceId: id });
+		});
+	}
 
-  vaults(): Promise<RpcResult<VaultInfo[]>> {
-    return rpcResult(() => this.repository.vaults());
-  }
+	vaults(): Promise<RpcResult<VaultInfo[]>> {
+		return rpcResult(() => this.repository.vaults());
+	}
 
-  createVault(input: VaultInfo): Promise<RpcResult<VaultInfo>> {
-    return rpcResult(async () => {
-      await this.repository.saveVault(input);
-      console.info({ event: "vault.created", vaultId: input.id });
+	createVault(input: VaultInfo): Promise<RpcResult<VaultInfo>> {
+		return rpcResult(async () => {
+			await this.repository.saveVault(input);
+			console.info({ event: "vault.created", vaultId: input.id });
 
-      return input;
-    });
-  }
+			return input;
+		});
+	}
 
-  vault(id: string): Promise<RpcResult<VaultInfo>> {
-    return rpcResult(() => this.repository.vault(id));
-  }
+	vault(id: string): Promise<RpcResult<VaultInfo>> {
+		return rpcResult(() => this.repository.vault(id));
+	}
 }
