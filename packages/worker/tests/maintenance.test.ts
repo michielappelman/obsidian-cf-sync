@@ -5,6 +5,7 @@ import type { R2VaultArchive } from "../src/infra/r2-vault-archive";
 import { VaultMaintenance } from "../src/infra/vault-maintenance";
 import type { VaultRepository } from "../src/infra/vault-repository";
 import { VaultSockets } from "../src/infra/vault-sockets";
+import { VaultWebhooks } from "../src/infra/vault-webhooks";
 import { FlushVault } from "../src/usecase/flush-vault";
 
 function storage() {
@@ -35,6 +36,10 @@ function maintenanceFor(state: ReturnType<typeof storage>) {
 	const sockets = new VaultSockets({ storage: durableStorage } as DurableObjectState);
 
 	return new VaultMaintenance(durableStorage, sockets);
+}
+
+function webhooksFor(state: ReturnType<typeof storage>) {
+	return new VaultWebhooks(state as unknown as DurableObjectStorage);
 }
 
 function socketsMock() {
@@ -73,7 +78,14 @@ describe("maintenance deadlines", () => {
 				.mockRejectedValueOnce(new Error("R2 down"))
 				.mockResolvedValue(null),
 		} as unknown as R2VaultArchive;
-		const flush = new FlushVault(repository, sockets, archive, maintenance, (action) => action());
+		const flush = new FlushVault(
+			repository,
+			sockets,
+			archive,
+			maintenance,
+			webhooksFor(state),
+			(action) => action(),
+		);
 		const logged = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		await flush.execute();
@@ -179,6 +191,7 @@ it("loads one document at a time when flushing a vault with many dirty notes", a
 		socketsMock(),
 		archive,
 		maintenanceFor(state),
+		webhooksFor(state),
 		(action) => action(),
 	);
 	await flush.execute();

@@ -1,7 +1,7 @@
 import type { Operation, Snapshot } from "@cf-sync/protocol";
 import { Hono } from "hono";
 import { toUint8Array, fromUint8Array } from "js-base64";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 
 import { authenticate } from "../src/infra/access-auth";
@@ -103,6 +103,9 @@ function setup() {
 		exclusions: async (paths: string[]) => unwrapRpcResult(await vault.setExclusions(paths)),
 		ticket: async () => unwrapRpcResult(await vault.issueTicket(deviceId)),
 		removeDevice: async () => unwrapRpcResult(await vault.removeDevice(deviceId)),
+		webhook: async (url: string, secret: string) =>
+			unwrapRpcResult(await vault.setWebhook(deviceId, { url, secret })),
+		removeWebhook: async () => unwrapRpcResult(await vault.removeWebhook(deviceId)),
 		operation,
 		vaultId,
 		deviceId,
@@ -361,6 +364,127 @@ it("fails closed without Access configuration or a signed assertion", async () =
 			} as Env)
 		).status,
 	).toBe(401);
+});
+
+describe("change webhooks", () => {
+	const url = "https://hooks.test/push/abc";
+	const secret = "s".repeat(32);
+
+	function receiver(status = 204) {
+		const calls: { url: string; authorization: string | null; body: unknown }[] = [];
+		const send = vi.fn(async (input: string, init: { headers: HeadersInit; body: string }) => {
+			calls.push({
+				url: input,
+				authorization: new Headers(init.headers).get("Authorization"),
+				body: JSON.parse(init.body),
+			});
+
+			return new Response(null, { status });
+		});
+		vi.stubGlobal("fetch", send);
+
+		return calls;
+	}
+
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("tells a device's webhook once that a burst of changes moved the vault", async () => {
+		const s = setup();
+		const calls = receiver();
+		await s.webhook(url, secret);
+		expect(s.storage.alarm).toBeNull();
+
+		await s.operation(create("a.md", "one"));
+		await s.operation(create("b.md", "two"));
+		expect(calls).toEqual([]);
+		await s.alarm();
+
+		expect(calls).toEqual([
+			{ url, authorization: `Bearer ${secret}`, body: { vaultId: s.vaultId, revision: 2 } },
+		]);
+		expect(s.storage.alarm).toBeNull();
+	});
+
+	it("does not tell a webhook of a replayed operation", async () => {
+		const s = setup();
+		const calls = receiver();
+		await s.webhook(url, secret);
+		const operation = create("a.md", "one");
+		await s.operation(operation);
+		await s.alarm();
+		await s.operation(operation);
+
+		expect(s.storage.alarm).toBeNull();
+		expect(calls).toHaveLength(1);
+	});
+
+	it("tells a webhook when the exclusions change", async () => {
+		const s = setup();
+		const calls = receiver();
+		await s.webhook(url, secret);
+		await s.exclusions(["Templates"]);
+		await s.alarm();
+
+		expect(calls.map((call) => call.body)).toEqual([{ vaultId: s.vaultId, revision: 1 }]);
+	});
+
+	it("schedules nothing for webhooks while none is registered", async () => {
+		const s = setup();
+		const calls = receiver();
+		await s.webhook(url, secret);
+		await s.removeWebhook();
+		await s.operation(create("a.md", "one"));
+
+		expect(s.storage.data.has("maintenance:webhooks")).toBe(false);
+		await s.alarm();
+		expect(calls).toEqual([]);
+	});
+
+	it("forgets a webhook its receiver no longer knows", async () => {
+		const s = setup();
+		const calls = receiver(404);
+		vi.spyOn(console, "info").mockImplementation(() => {});
+		await s.webhook(url, secret);
+		await s.operation(create("a.md", "one"));
+		await s.alarm();
+		await s.operation(create("b.md", "two"));
+		await s.alarm();
+
+		expect(calls).toHaveLength(1);
+		expect(s.storage.data.has(`webhook:${s.deviceId}`)).toBe(false);
+	});
+
+	it("keeps a webhook that failed, without retrying or failing the flush", async () => {
+		const s = setup();
+		const calls = receiver(500);
+		const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+		await s.webhook(url, secret);
+		await s.operation(create("a.md", "one"));
+		await s.alarm();
+
+		expect(calls).toHaveLength(1);
+		expect(warned).toHaveBeenCalledWith({
+			event: "webhook.rejected",
+			deviceId: s.deviceId,
+			status: 500,
+		});
+		expect(s.storage.alarm).toBeNull();
+		expect(s.objects.size).toBe(1);
+		expect(s.storage.data.has(`webhook:${s.deviceId}`)).toBe(true);
+	});
+
+	it("removes a deleted device's webhook", async () => {
+		const s = setup();
+		const calls = receiver();
+		await s.webhook(url, secret);
+		await s.removeDevice();
+		await s.operation(create("a.md", "one"));
+		await s.alarm();
+
+		expect(calls).toEqual([]);
+	});
 });
 
 describe("Durable Object RPC", () => {

@@ -17,6 +17,8 @@ import type { RpcResult } from "../rpc-result";
 import { VaultMaintenance } from "../vault-maintenance";
 import { VaultRepository } from "../vault-repository";
 import { VaultSockets } from "../vault-sockets";
+import { VaultWebhooks } from "../vault-webhooks";
+import type { Webhook } from "../vault-webhooks";
 
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 
@@ -24,6 +26,7 @@ export class Vault extends DurableObject<Env> {
 	private tail: Promise<unknown> = Promise.resolve();
 	private readonly repository: VaultRepository;
 	private readonly sockets: VaultSockets;
+	private readonly webhooks: VaultWebhooks;
 	private readonly flush: FlushVault;
 	private readonly maintenance: VaultMaintenance;
 
@@ -31,6 +34,7 @@ export class Vault extends DurableObject<Env> {
 		super(state, env);
 
 		this.sockets = new VaultSockets(state);
+		this.webhooks = new VaultWebhooks(state.storage);
 		this.maintenance = new VaultMaintenance(state.storage, this.sockets);
 		this.repository = new VaultRepository(state.storage, this.maintenance, state.id.name);
 		this.flush = new FlushVault(
@@ -38,6 +42,7 @@ export class Vault extends DurableObject<Env> {
 			this.sockets,
 			new R2VaultArchive(env.BUCKET),
 			this.maintenance,
+			this.webhooks,
 			(action) => this.serial(action),
 		);
 	}
@@ -73,6 +78,7 @@ export class Vault extends DurableObject<Env> {
 			this.run(async (meta) => {
 				await this.repository.setExclusions(meta, exclusions);
 				await this.maintenance.schedule();
+				await this.requestWebhooks();
 				this.sockets.broadcast({ type: "settings", revision: meta.revision });
 
 				return await this.readSnapshot(meta);
@@ -120,8 +126,21 @@ export class Vault extends DurableObject<Env> {
 		});
 	}
 
+	setWebhook(deviceId: string, webhook: Webhook): Promise<RpcResult<void>> {
+		return rpcResult(() => this.run(() => this.webhooks.set(deviceId, webhook)));
+	}
+
+	removeWebhook(deviceId: string): Promise<RpcResult<void>> {
+		return rpcResult(() => this.serial(() => this.webhooks.remove(deviceId)));
+	}
+
 	removeDevice(deviceId: string): Promise<RpcResult<void>> {
-		return rpcResult(() => this.serial(() => this.sockets.removeDevice(deviceId)));
+		return rpcResult(() =>
+			this.serial(async () => {
+				await this.sockets.removeDevice(deviceId);
+				await this.webhooks.remove(deviceId);
+			}),
+		);
 	}
 
 	override async fetch(request: Request): Promise<Response> {
@@ -225,6 +244,11 @@ export class Vault extends DurableObject<Env> {
 		};
 		const result = await applyOperation(context, meta, operation, deviceId);
 
+		// A replayed or rejected operation leaves the revision where it was.
+		if (result.revision > meta.revision) {
+			await this.requestWebhooks();
+		}
+
 		console.info({
 			event: "sync.operation.completed",
 			vaultId: meta.vaultId,
@@ -236,6 +260,12 @@ export class Vault extends DurableObject<Env> {
 		});
 
 		return result;
+	}
+
+	private async requestWebhooks(): Promise<void> {
+		if (await this.webhooks.registered()) {
+			await this.maintenance.request("webhooks");
+		}
 	}
 
 	private async readSnapshot(meta: VaultMeta): Promise<ReadableStream<Uint8Array>> {

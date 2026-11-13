@@ -12,6 +12,12 @@ const exclusionsSchema = v.object({
 	exclusions: v.pipe(v.array(pathSchema), v.maxLength(1000)),
 });
 
+const webhookSchema = v.object({
+	url: v.pipe(v.string(), v.maxLength(2000), v.url(), v.startsWith("https://")),
+	// Sent as a bearer token, so only characters a header carries unchanged.
+	secret: v.pipe(v.string(), v.regex(/^[\w-]{32,200}$/u)),
+});
+
 const searchSchema = v.object({
 	q: v.pipe(v.string(), v.trim(), v.minLength(1), v.maxLength(500)),
 	limit: v.optional(
@@ -75,6 +81,21 @@ vaultApiRoutes.put("/exclusions", async (c) => {
 	const result = await vault.setExclusions(exclusions);
 
 	return jsonStreamResponse(result);
+});
+
+vaultApiRoutes.put("/webhook", async (c) => {
+	const webhook = v.parse(webhookSchema, await c.req.json());
+	const vault = c.get("vault");
+	unwrapRpcResult(await vault.setWebhook(c.get("deviceId"), webhook));
+
+	return c.body(null, 204);
+});
+
+vaultApiRoutes.delete("/webhook", async (c) => {
+	const vault = c.get("vault");
+	unwrapRpcResult(await vault.removeWebhook(c.get("deviceId")));
+
+	return c.body(null, 204);
 });
 
 vaultApiRoutes.post("/tickets", async (c) => {

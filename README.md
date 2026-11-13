@@ -48,6 +48,10 @@ pnpm --filter @cf-sync/worker exec cf deploy --secrets-file .dev.vars
 
 `GET /api/vaults/:id/search?q=<query>&limit=<1-50>` searches a vault with [AI Search](https://developers.cloudflare.com/ai-search/). It returns `{query, results: [{path, score, text}]}`. The Worker binds an AI Search instance named `obsidian-cf-sync`, so create it before deploying: R2-backed on your bucket, include only `vaults/*/files/**`, similarity cache off. The index refreshes on the instance's sync interval, so recent edits and deletions appear after the next sync. AI Search stores note text in its own index.
 
+### Change webhook
+
+`PUT /api/vaults/:id/webhook` with `{url, secret}` registers one webhook for the calling device, and `DELETE /api/vaults/:id/webhook` removes it. About ten seconds after the vault changes, the Worker sends `POST <url>` with `Authorization: Bearer <secret>` and `{vaultId, revision}`: once per burst of changes, and without saying what changed. The `url` must be `https`, and the `secret` 32 to 200 characters of `A-Z a-z 0-9 _ -`. A delivery is not retried. A `404` or `410` answer removes the webhook, and so does deleting its device.
+
 ## Plugin installation
 
 In Obsidian, open **Settings → Community plugins → Browse**, search for **CF Sync**, and install and enable it. If restricted mode is on, turn on community plugins first.
